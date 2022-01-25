@@ -21,9 +21,10 @@ torch.backends.cudnn.deterministic=True
 # === CUTOUT ===========================================================================================================
 # adapted from github.com/hysts/pytorch_cutout
 class Cutout:
-    def __init__(self, mask_size, p, mask_color=(0, 0, 0)):
+    def __init__(self, mask_size, p, mask_color=(0, 0, 0), scale=True):
         self.mask_size = mask_size
         self.p = p
+        self.scale = scale
         self.mask_color = mask_color
         self.mask_size_half = mask_size // 2
         self.offset = 1 if mask_size % 2 == 0 else 0
@@ -49,10 +50,23 @@ class Cutout:
         ymin = max(0, ymin)
         xmax = min(w, xmax)
         ymax = min(h, ymax)
-        image[ymin:ymax, xmin:xmax] = self.mask_color[0]*255.
+        if self.scale:
+            image[ymin:ymax, xmin:xmax] = self.mask_color[0]*255
+        else:
+            image[ymin:ymax, xmin:xmax] = self.mask_color[0]
         return image
 
 
+class FuckyTranspose:
+    def __init__(self):
+        pass
+    
+    def __call__(self, image):
+        image = np.asarray(image).copy()
+        image = np.moveaxis(image, -1, 0)
+        image = image.reshape(32, 32, 3)
+        return image
+    
 # === DATA HELPERS =====================================================================================================
 def load_data(batch_size, dataset, metadata=None):
     data_path = os.getcwd() + "/data/"
@@ -70,12 +84,12 @@ def load_data(batch_size, dataset, metadata=None):
         
         train_transform = transforms.Compose([
             transforms.RandomHorizontalFlip(),
-            Cutout(mask_size=16, p=.5, mask_color=MEAN),
+            Cutout(mask_size=16, p=.5, mask_color=MEAN),  
             transforms.ToTensor(),
-            transforms.Normalize(MEAN/255, STD/255)])
+            transforms.Normalize(MEAN, STD)])
         test_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(MEAN/255, STD/255)])
+            transforms.Normalize(MEAN, STD)])
         train_xs = [train_transform(x) for x in train_xs]
         test_xs = [test_transform(x) for x in test_xs]
         
@@ -93,6 +107,7 @@ def load_data(batch_size, dataset, metadata=None):
                                       transform=transforms.Compose([
                                           transforms.RandomCrop(32, padding=4),
                                           transforms.RandomHorizontalFlip(),
+                                          FuckyTranspose(),
                                           Cutout(mask_size=16, p=.5, mask_color=MEAN),
                                           transforms.ToTensor(),
                                           transforms.Normalize(MEAN, STD)]
@@ -101,9 +116,14 @@ def load_data(batch_size, dataset, metadata=None):
                                      train=False,
                                      download=download,
                                      transform=transforms.Compose([
+                                         FuckyTranspose(),
                                          transforms.ToTensor(),
                                          transforms.Normalize(MEAN, STD)]
                                      ))
+        valid_size = 10*batch_size
+        train_subset  = torch.utils.data.Subset(train_data, range(0, len(train_data)-valid_size))
+        valid_data = torch.utils.data.Subset(train_data, range(len(train_data)-valid_size, len(train_data)))
+        train_data = train_subset
     elif dataset == "MNIST":
         train_data = datasets.MNIST(data_path+dataset,
                                     train=True, 
@@ -152,11 +172,15 @@ def load_data(batch_size, dataset, metadata=None):
 
     train_loader = torch.utils.data.DataLoader(train_data,
                                                batch_size=batch_size,
-                                               shuffle=True)
+                                               shuffle=True,
+                                               drop_last=True)
     test_loader = torch.utils.data.DataLoader(test_data,
                                               batch_size=batch_size,
                                               shuffle=False)
-    del train_data, test_data
+    valid_loader = torch.utils.data.DataLoader(valid_data,
+                                              batch_size=batch_size,
+                                              shuffle=False)
+    del train_data, test_data, valid_data
         
     # get/load dataset metadata
     for val in train_loader:
@@ -167,7 +191,7 @@ def load_data(batch_size, dataset, metadata=None):
         data_shape = img.shape
         break
 
-    return [train_loader, test_loader], data_shape
+    return [train_loader, test_loader, valid_loader], data_shape
 
 
 # === AUGMENTATION PREVIEW =============================================================================================

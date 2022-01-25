@@ -2,11 +2,18 @@ from IPython.display import clear_output
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import math
 from matplotlib import gridspec
 import numpy as np
 import time
+import os
 import re
-from spider_net.helpers import show_time
+
+try:
+    from helpers import show_time
+except ImportError as e:
+    from spider_net.helpers import show_time
+    
 from scipy.optimize import curve_fit
 import sys
 
@@ -32,7 +39,9 @@ def time_parse(t):
     else:
         return float(t.split('s')[0])
 
-
+def round_to_1(x):
+    return round(x, -int(math.floor(math.log10(abs(x)))))
+    
 # === DATA LOADING =====================================================================================================
 path = ""
 
@@ -43,8 +52,8 @@ def get_prune_logs():
     return out.split("\n")
 
 
-def get_raw_runs():
-    with open(path + "logs/trainer.log") as f:
+def get_raw_runs(file):
+    with open(path + "logs/{}.log".format(file)) as f:
         data = f.read()
     runs = data.split('=== NEW FULL TRAIN ===')
     return [run for run in runs if 'Starting at' in run]
@@ -56,7 +65,10 @@ def scrape(prog=False):
     row = {}
     aim, target = 0, 0
     logs = get_prune_logs()
-    curr_prog = int([log for log in logs if '%' in log and 'Train Epoch' in log][-1].split("(")[1].split("%")[0])
+    try:
+        curr_prog = int([log for log in logs if '%' in log and 'Train Epoch' in log][-1].split("(")[1].split("%")[0])
+    except:
+        curr_prog = 0
     if prog:
         return curr_prog
 
@@ -176,6 +188,10 @@ def time_proc(raw_line):
             run_time = run_time.replace(',', "")
         else:
             run_time = raw_line.split(", ")[-1]
+            
+        if "h," in run_time:
+            run_time = run_time.replace("h,","h")
+            
 
         secs = 0
         if 'h' in run_time:
@@ -203,13 +219,14 @@ def time_proc(raw_line):
         raise e
 
 
-def proc_run(run):
+def proc_run(run, tag=None):
     run_details = {}
     curr_epoch = -1
     deadhead_history = []
     param_history = []
     epochs,epoch_times = [],[]
     a_loss, e_loss, i_loss = [], [], []
+    lrs = []
 
     prev_line = ""
     for raw_line in run.split("\n"):
@@ -269,6 +286,20 @@ def proc_run(run):
             loss_comps = raw_line.split(':')
             a, e, i = [float(loss.split(",")[0]) for loss in loss_comps[2:]]
             a_loss, e_loss, i_loss = a_loss + [a], e_loss + [e], i_loss + [i]
+        if 'Adjusting lrs' in raw_line:
+            raw_line = raw_line.replace("\x1b[0m","").replace("~","")
+            try:
+                if "[" in raw_line and "]" in raw_line:
+                    if "," in raw_line:
+                        lrs.append(float(raw_line.split("to [")[1].split(",")[0]))
+                    else:
+                        lrs.append(float(raw_line.split("to [")[1].split("]")[0]))
+                else:
+                    lrs.append(float(raw_line.split("to ")[1]))
+            except Exception as e:
+                print(raw_line)
+                raise e
+            
         if raw_line != "":
             prev_line = raw_line
     run_details['Loss Accuracy'] = a_loss
@@ -277,6 +308,8 @@ def proc_run(run):
     run_details['Loss Edge'] = e_loss
     run_details['Loss Input'] = i_loss
     run_details['Epochs'] = epochs
+    run_details['Tag'] = tag
+    run_details['LR max'] = round_to_1(max(lrs)) if len(lrs) and max(lrs)>0 else 0
 
     # flatten param hist
     if [x for x in param_history if type(x) is not int]:
@@ -294,13 +327,27 @@ def proc_run(run):
 
 
 def proc_all_runs():
-    runs = [proc_run(run) for run in get_raw_runs()]
-    runs = pd.DataFrame(runs)
+    runs = [proc_run(run, 'bonsai') for run in get_raw_runs("trainer_bn")]
+    runs += [proc_run(run, 'spider') for run in get_raw_runs("trainer")]
+    runs += [proc_run(run, '3090') for run in get_raw_runs("3090_trainer")]
+    runs += [proc_run(run, 'spiderblock') for run in get_raw_runs("../../SpiderBlockNet/logs/trainer")]
+
+    
+    runs = pd.DataFrame(runs).drop_duplicates(["Start Time", "ID"]).sort_values("Start Time")
     for col in [col for col in list(runs) if 'Top' in col]:
         runs[col] = runs[col].apply(lambda x: x if type(x) == list else [])
     runs['LT Test Top-1 Max'] = runs['LT Test Top-1'].apply(lambda x: max(x, default=0))
     runs['Epoch'] = runs['Epochs'].apply(lambda x: x[-1] if len(x) else 0)
     return runs
+
+
+def run_filter(x):
+    if 'spiderblock' in x['Tag'] and x['Epoch']>100:
+        return True
+    elif len(x['Epochs']) and max(x['Epochs'])>511:
+        return True
+    else:
+        return False
 
 
 # === TRAIN VISUALIZATION ==============================================================================================
@@ -313,18 +360,25 @@ class TrainAnimator:
 
     def animate(self, i):
         runs = proc_all_runs()
-        full_runs = runs[runs['Epochs'].apply(lambda x: len(x)>1 and max(x)>512)].sort_values(by='LT Test Top-1 Max', ascending=False)
+        full_runs = runs[runs.apply(run_filter, axis=1)].sort_values(by='LT Test Top-1 Max', ascending=False)
         #full_runs = pd.concat([runs[852:858], runs[868:]])
 
-        full_runs = full_runs[full_runs['Epoch']==63].sort_values(by='LT Test Top-1 Max', ascending=False)
-        display(full_runs)
-        compare = full_runs['LT Test Top-1'].values[0]
+        full_runs = full_runs[full_runs['Tag'].apply(lambda x: x in ['spider','3090'])]
+        #display(full_runs)
+        compare = full_runs['LT Test Top-1'].values[1]
+        compare_name = full_runs['ID'].values[1]
         compare_str = 'PR'
 
-        lt = max(runs.iloc[-1]['LT Test Top-1'])
-        lt_last = runs.iloc[-1]['LT Test Top-1'][-1]
+        
         curr_run = runs.iloc[-1]
-        epoch = runs.iloc[-1]['Epoch']
+        epoch = curr_run['Epoch']
+        if len(curr_run['LT Test Top-1']):
+            lt = max(curr_run['LT Test Top-1'])
+            lt_last = curr_run['LT Test Top-1'][-1]
+
+        else:
+            lt = 0
+            lt_last = 0
         cm = plt.cm.Spectral
 
         def smooth_max(l):
@@ -353,7 +407,7 @@ class TrainAnimator:
             labeled = full_runs.sort_values(by='Start Time',ascending=False)
             labeled = list(labeled[labeled['Start Time'].apply(lambda x: x>=marker)]['ID'])
         else:
-            labeled = list(full_runs.sort_values(by='Start Time',ascending=False)[:3]['ID'])
+            labeled = list(full_runs.sort_values(by='LT Test Top-1 Max', ascending=False)[:3]['ID'])
 
         # plot previous runs
         w = 5, 15
@@ -375,10 +429,15 @@ class TrainAnimator:
                 if min(xs) == 0 and max(xs) == 518:
                     xs += 82
                 color = "#68099c" if run['ID'] == self.marker else cm(i / len(full_runs))
+                if run['Tag'] == 'spider':
+                    linewidth = 1.5
+                else:
+                    linewidth = 1
                 self.axes[0].plot(xs,
                                   smooth_max(ys),
                                   color=color,
                                   alpha=(.75 if i == 0 else .5) + .05,
+                                  linewidth=linewidth,
                                   label=label)
                     
         # plot current run
@@ -386,10 +445,16 @@ class TrainAnimator:
             print("No log yet...")
         else:
             if epoch != self.curr_epoch:
-                print()
-                curr = curr_run['LT Test Top-1'][-1]
-                curr_max = max(curr_run['LT Test Top-1'])
-                curr_arg_max = np.argmax(curr_run['LT Test Top-1'])
+                if len(curr_run['LT Test Top-1']):
+                    curr = curr_run['LT Test Top-1'][-1]
+                    curr_max = max(curr_run['LT Test Top-1'])
+                    curr_arg_max = np.argmax(curr_run['LT Test Top-1'])
+                    yrange = 100 - min(curr_run['LT Test Top-1'][-10:])
+                    recent_min = min(curr_run['LT Test Top-1'][-10:]) - 1
+                else:
+                    curr, curr_max, curr_arg_max = 0, 0, 0
+                    recent_min = 0
+                    yrange = 100
                 if max(compare)<=curr_max:
                     rec, rec_max, rec_arg_max = curr, max(compare), np.argmax(compare)
                 else:
@@ -398,6 +463,7 @@ class TrainAnimator:
                 text = "==== EPOCH {} ======================================\n".format(epoch)
                 text += "LT Max: {}\n".format(lt)
                 text += "LT Last: {}\n".format(lt_last)
+                text += "Compare: {}\n".format(compare_name)
                 text += "Current Delta to {}:     {:> 2.2f}% ({}% vs {}%)\n".format(compare_str, curr - rec, curr, rec)
                 text += "Current Delta to {} Max: {:> 2.2f}% ({}% @{} vs {}% @{})".format(compare_str,
                                                                                           curr_max - rec_max,
@@ -405,25 +471,25 @@ class TrainAnimator:
                                                                                           curr_arg_max,
                                                                                           rec_max,
                                                                                           rec_arg_max)
-                yrange = 100 - min(curr_run['LT Test Top-1'][-10:])
+
                 #self.axes[0].text(-30, 101 + yrange / 15, text, fontsize=8, fontfamily='monospace')
-                self.axes[0].text(-1, 101 + yrange / 15, text, fontsize=8, fontfamily='monospace')
+                self.axes[0].text(-30, 100+yrange/10, text, fontsize=8, fontfamily='monospace')
                 ys = curr_run['LT Test Top-1']
                 xs = list(curr_run['Epochs'])[:len(ys)]
-                label = "{} {}: {}".format(curr_run['ID'],curr_run['Start Time'],max(curr_run['LT Test Top-1'])) 
+                label = "{} {}: {}".format(curr_run['ID'],curr_run['Start Time'],curr_max) 
                 self.axes[0].plot(xs, ys, color='k', linewidth=1.5,label=label)
                 x_f, y_f = fit_curve(xs, ys)
                 if 0: #x_f is not None:
                     self.axes[0].plot(x_f, y_f, color='k', alpha=.5, linewidth=1.5, linestyle='--')
                 
                 # self.axes[0].plot(xs, ys, color='k', linewidth=1.5)
-                self.axes[0].set_ylim(min(curr_run['LT Test Top-1'][-10:]) - 1, 100)
-                self.axes[0].set_ylim(90, 100)
-                self.axes[0].set_title("CIFAR-10 Loss History, Bonsai Net")
+              
+                self.axes[0].set_ylim(recent_min, 100)
+                self.axes[0].set_title("CIFAR-10 Loss History, SpiderNet")
                 self.axes[0].set_xlabel("Epoch", fontsize=8)
                 self.axes[0].set_ylabel("Accuracy", fontsize=8)
                 self.axes[0].legend()
-                ax_min, ax_max = min(50, int(min(curr_run['LT Test Top-1'][-10:]))), 100
+                ax_min, ax_max = min(90, int(recent_min+1)), 100
                 if ax_max - ax_min > 20:
                     div = 5
                     ax_min = (ax_min // div) * div
@@ -436,9 +502,9 @@ class TrainAnimator:
                 self.axes[0].set_yticks(np.arange(ax_min, ax_max, div))
                 self.axes[0].tick_params(axis='both', which='major', labelsize=8)
                 self.curr_epoch = epoch
-                plt.savefig('/home/campus.ncl.ac.uk/b6070424/Dropbox/PhD/monitoring.png',
-                            facecolor="#263238",
-                            bbox_inches="tight")
+#                 plt.savefig('/home/campus.ncl.ac.uk/b6070424/Dropbox/PhD/monitoring.png',
+#                             facecolor="#263238",
+#                             bbox_inches="tight")
 
         prog = scrape(prog=True)
         if prog != self.prog:

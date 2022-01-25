@@ -22,6 +22,7 @@ class Pruner(nn.Module):
         self.mem_size = mem_size
         self.weight = nn.Parameter(torch.tensor([init]))
         self.m = m
+        self.m_inv = 1/m
         self.weight_history = np.array([])
 
     def __str__(self):
@@ -38,12 +39,13 @@ class Pruner(nn.Module):
     def track_gates(self):
         self.weight_history = np.append(self.weight_history, self.gate().item())
 
-    def get_deadhead(self, prune_interval, verbose=False):
-        if len(self.weight_history) < prune_interval:
+    def get_deadhead(self, prune_interval, verbose=False, force=False):
+        if len(self.weight_history) < prune_interval and not force:
             return False
-        deadhead = (prune_interval * .25) > sum(self.weight_history[-prune_interval:])
+        deadhead = (prune_interval * .25) > sum(self.weight_history[-prune_interval:]) or force
         if deadhead:
             self.switch_off()
+        self.weight_history = self.weight_history[-prune_interval:]
         
         if verbose:
             print(self.weight_history, deadhead)
@@ -61,14 +63,15 @@ class Pruner(nn.Module):
         elif self.weight < -bound:
             self.weight.data = self.weight.data * -bound/self.weight.data
             #2print(pre, self.weight.item())
-            
+         
+    def saw(self):
+        return torch.remainder(self.weight, self.m_inv)
+        
     def gate(self):
         return self.weight > 0
-        #return torch.sigmoid(self.m * self.weight)
 
     def sg(self):
-        saw = (self.m * self.weight - torch.floor(self.m * self.weight)) / self.m
-        return saw + self.gate()
+        return self.saw() + self.gate()
 
     def forward(self, x):
         return self.sg() * x
@@ -86,7 +89,7 @@ class PrunableOperation(nn.Module):
         self.prune = prune
         if self.prune:
             self.pruner = Pruner(mem_size=mem_size, init=pruner_init)
-        if pruner_init is 'off':
+        if pruner_init == 'off':
             self.zero = True
             self.pruner.switch_off()
         self.analytics = {'pruner': [None]*start_idx,
@@ -99,13 +102,14 @@ class PrunableOperation(nn.Module):
 
     def get_growth_factor(self):
         return {'weight': self.pruner.weight.item(),
-                'grad': self.pruner.weight.grad.item()}
+                'grad': self.pruner.weight.grad.item() if self.pruner.weight.grad is not None else None}
 
-    def deadhead(self, prune_interval):
-        if self.zero or not self.pruner.get_deadhead(prune_interval):
+    def deadhead(self, prune_interval, force=False):
+        if self.zero or not self.pruner.get_deadhead(prune_interval, force=force):
             return 0
         else:
             self.op = Zero(self.stride)
+            self.name = "Zero"
             self.zero = True
             return 1
 
@@ -154,7 +158,6 @@ class PrunableTower(nn.Module):
 
     def forward(self, x):
         return self.ops(x)
-
 
 
 # === INPUT HANDLER FOR PRUNED CELL INPUTS

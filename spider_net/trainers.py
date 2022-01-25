@@ -47,7 +47,7 @@ def top_k_accuracy(output, target, top_k):
         target_expand = target.unsqueeze(1).repeat(1,k,1,1)
         equal = torch.max(pred[:,:k,:,:].eq(target_expand),1)[0]
         correct[i] = torch.sum(equal)
-    return correct, len(target.view(-1)), equal
+    return correct, len(target.view(-1)), equal.cpu().numpy()
 
 
 def accuracy_string(prefix, corrects, divisor, t_start, top_k, comp_ratio=None, return_str=False):
@@ -64,7 +64,29 @@ def accuracy_string(prefix, corrects, divisor, t_start, top_k, comp_ratio=None, 
     else:
         log_print(out_string)
 
+        
+def compression_loss(model, comp_lambda, comp_ratio, item_output=False):
+    # edge pruning
+    dummy_zero = torch.tensor([0.], device='cuda')
+    if comp_lambda>0:
+        prune_sizes = []
+        for cell in model.cells:
+            edge_pruners = [op.pruner.mem_size*torch.clamp(op.pruner.sg(),0.,1.) if op.pruner else dummy_zero\
+                                for key, edge in cell.edges.items() for op in edge.ops]
+            prune_sizes += [torch.sum(torch.cat(edge_pruners)).view(-1)]
+        edge_comp_ratio = torch.div(torch.cat(prune_sizes), model.edge_sizes)
+        edge_comp = torch.norm(comp_ratio - edge_comp_ratio)
+        edge_loss = comp_lambda * edge_comp
+    else:
+        edge_loss = 0
 
+    if item_output:
+        ecr = 0 if edge_loss == 0 else torch.mean(edge_comp_ratio).item()
+        return edge_loss, ecr
+    else:
+        return edge_loss, None
+        
+        
 # === BASE LEVEL TRAIN AND TEST FUNCTIONS===============================================================================
 def train(model, device, **kwargs):
     # === tracking stats ======================
@@ -107,14 +129,23 @@ def train(model, device, **kwargs):
         def loss_f(x): return kwargs['criterion'](x, target)
         losses = [loss_f(output) for output in outputs[:-1]]
         final_loss = loss_f(outputs[-1])
-        loss = final_loss + .2 * sum(losses)
+        loss = final_loss + .4 * sum(losses)
+        
+        if kwargs.get('comp_lambda') is not None:
+            comp_loss, comp_ratio = compression_loss(model, 
+                                                     comp_lambda=kwargs.get('comp_lambda'),
+                                                     comp_ratio=kwargs['comp_ratio'],
+                                                     item_output=print_or_end)
+            loss = loss + comp_loss
 
         # end train step ======================
-        loss = loss/multiplier
+
         loss.backward()
 
-        model.compile_growth_factors()
-        model.compile_pruner_stats()
+        if kwargs.get('mutate', False):
+            model.compile_growth_factors()
+        if kwargs.get('prune', True):
+            model.compile_pruner_stats()
         if (batch_idx % multiplier == 0) or (batch_idx == len(train_loader) - 1):
             kwargs['optimizer'].step()
         corr, div, _ = top_k_accuracy(outputs[-1], target, top_k=kwargs.get('top_k', [1]))
@@ -130,6 +161,8 @@ def train(model, device, **kwargs):
                 len(train_loader.dataset),
                 100. * (batch_idx + 1) / len(train_loader))
             prog_str += 'Per Epoch: {:<7}, '.format(show_time((time.time() - batch_start) * len(train_loader)))
+            if kwargs.get('comp_lambda') is not None:
+                prog_str += 'Comp Ratio: {:.3f}'.format(comp_ratio)
             prog_str += 'Alloc: {}, '.format(sizeof_fmt(cache, spacing=True))
             prog_str += 'Data T: {:<6.3f}, Op T: {:<6.3f}'.format(t_cumul_data, t_cumul_ops)
             jn_print(prog_str, end="\r", flush=True)
@@ -264,21 +297,21 @@ def full_train(model, kwargs):
         out_str, outputs, targets, metas = test(model, kwargs['device'], top_k=kwargs.get('top_k', [1]))
         log_print(out_str)
         model.epoch += 1
-        model.save_analytics()
-        
-        if epoch in [3,7,15,31,63,127,255,511]:
-            for n in [16, 64, 128, 256]:
-                model.compute_shap_values(n*model.get_n_edges())
-                growth_factors = model.get_growth_factors()
-            
-                with open('correlations/{}_{}_{}.pkl'.format(model_start_time, epoch, n), "wb") as f:
-                    pkl.dump(growth_factors, f)
-            
 
+        if kwargs.get('mutate', False):
+            model.save_analytics()
+    
         # prune ==============================
-        if model.prune:
+        if model.prune and kwargs.get('prune', True):
             model.deadhead(kwargs['prune_interval']*len(model.data[0]))
+            hard, soft = model.genotype_compression()
+            if soft and hard:
+                jn_print("Soft Comp: {:.3f}, Hard Comp: {:.3f}".format(soft, hard))
 
+        if epoch == kwargs.get('break_after', -1):
+            break
+            
+            
         # mutate
         if epoch and (epoch-last_mutation) % kwargs['lr_schedule']['T'] == 0 and kwargs.get('mutate', True):
             mutations, new_edges = model.mutate(n=kwargs['n_mutations'])

@@ -169,6 +169,12 @@ def cw_mod(dim, by):
 
 
 # === I/O HELPERS ======================================================================================================
+def rank(arr, max_at_rank0=False):
+    num_map  = {j: i for i, j in enumerate(sorted(set(arr),reverse=max_at_rank0))}
+    ranks = np.array([num_map[n] for n in arr])
+    return ranks
+
+
 class Count:
     def __init__(self):
         self.i = 0
