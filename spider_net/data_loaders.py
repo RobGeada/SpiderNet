@@ -4,9 +4,9 @@ import os
 
 import torch
 from torchvision import datasets, transforms
-from data.gen_language_data import load_language_data
-from data.gen_multnist import load_multnist_data
-from data.gen_dolphin_data import load_dolphin_data
+#from data.gen_language_data import load_language_data
+#from data.gen_multnist import load_multnist_data
+#from data.gen_dolphin_data import load_dolphin_data
 
 # === set seeds ===
 '''
